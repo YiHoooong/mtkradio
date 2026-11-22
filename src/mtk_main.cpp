@@ -82,7 +82,7 @@ struct MinimalRadiotap {
 };
 #pragma pack(pop)
 
-void build_rx_radiotap(const mtk::RxFrame &f, std::vector<uint8_t> &out) {
+void append_rx_wire(const mtk::RxFrame &f, std::vector<uint8_t> &batch) {
   MinimalRadiotap rt{};
   rt.version = 0;
   rt.length = sizeof(rt);
@@ -91,9 +91,14 @@ void build_rx_radiotap(const mtk::RxFrame &f, std::vector<uint8_t> &out) {
   rt.flags = (f.channel <= 14) ? 0x00a0u : 0x0140u; /* 2 GHz CCK/OFDM vs 5 GHz OFDM */
   rt.dbm = f.dbm;
 
-  out.resize(sizeof(rt) + f.len);
-  std::memcpy(out.data(), &rt, sizeof(rt));
-  std::memcpy(out.data() + sizeof(rt), f.data, f.len);
+  const radio_link_header hdr{static_cast<uint16_t>(RADIO_LINK_RX), 0,
+                              static_cast<uint32_t>(sizeof(rt) + f.len)};
+  const size_t old_sz = batch.size();
+  batch.resize(old_sz + sizeof(hdr) + sizeof(rt) + f.len);
+  uint8_t *dst = batch.data() + old_sz;
+  std::memcpy(dst, &hdr, sizeof(hdr));
+  std::memcpy(dst + sizeof(hdr), &rt, sizeof(rt));
+  std::memcpy(dst + sizeof(hdr) + sizeof(rt), f.data, f.len);
 }
 
 bool is_awdl_bssid(const uint8_t *frame, size_t len) {
@@ -267,12 +272,17 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> frame;
     mtk::TxParams params;
   };
-  constexpr size_t kUnicastQueueMax = 128;
+  constexpr size_t kUnicastQueueMax = 256;
   std::deque<QueuedTx> unicast_q;
 
-  std::vector<uint8_t> rx_wire;
+  std::vector<uint8_t> rx_batch;
+  rx_batch.reserve(128 * 1024);
   std::vector<std::array<uint8_t, 33>> addba_responses;
+  uint64_t last_active_us = 0;
+  constexpr uint64_t kSpinWindowUs = 5000; /* 5 ms active spin before Sleep(1) */
+
   while (!stopping()) {
+    size_t tx_sent = 0;
     /* Process commands from awdld on the radio thread (MtkDevice is single-threaded). */
     std::deque<PendingCmd> local;
     {
@@ -287,22 +297,24 @@ int main(int argc, char **argv) {
         if (mtk::parse_tx_radiotap(c.payload.data(), c.payload.size(), frame, flen, tx_params)) {
           const bool is_data = (frame[0] & 0x0cu) == 0x08u;
           const bool is_unicast = flen >= 10 && (frame[4] & 1u) == 0;
-          const bool to_sched_peer = is_data && is_unicast && have_sched_peer &&
+          const bool to_sched_peer = !no_block_ack && is_data && is_unicast && have_sched_peer &&
                                      std::memcmp(frame + 4, sched_peer, 6) == 0;
           if (to_sched_peer && sched.known()) {
             if (unicast_q.size() >= kUnicastQueueMax) unicast_q.pop_front();
             unicast_q.push_back({std::vector<uint8_t>(frame, frame + flen), tx_params});
           } else {
-            dev.transmit(frame, flen, tx_params);
+            if (dev.transmit(frame, flen, tx_params, false)) tx_sent++;
           }
         }
       } else if (c.type == RADIO_LINK_SET_CHANNEL && c.payload.size() >= 1) {
+        dev.kick_tx();
         const uint8_t ch = c.payload[0];
         dev.set_channel(ch, ch <= 14 ? 20 : width);
         sched.reset();
         have_sched_peer = false;
         gate_since_us = 0;
       } else if (c.type == RADIO_LINK_SET_ADDRESS && c.payload.size() >= 6) {
+        dev.kick_tx();
         std::memcpy(own_mac.data(), c.payload.data(), 6);
         dev.set_address(own_mac.data());
       } else if (c.type == RADIO_LINK_SET_BSSID_FILTER && c.payload.size() >= 6) {
@@ -313,11 +325,13 @@ int main(int argc, char **argv) {
         }
       }
     }
+    dev.kick_tx();
 
     addba_responses.clear();
+    rx_batch.clear();
     const size_t got = dev.poll([&](const mtk::RxFrame &f) {
       const uint64_t heard = now_us();
-      if (f.len >= 16 && f.channel == dev.channel()) {
+      if (!no_block_ack && f.len >= 16 && f.channel == dev.channel()) {
         const uint8_t *from = f.data + 10;
         const bool is_sched = have_sched_peer && std::memcmp(from, sched_peer, 6) == 0;
         const bool want = is_sched || !sched.fresh(heard);
@@ -400,13 +414,16 @@ int main(int argc, char **argv) {
       if (!pipe.connected()) return;
       if (filter_active && f.len >= 22 && std::memcmp(f.data + 16, bssid_filter.data(), 6) != 0)
         return;
-      build_rx_radiotap(f, rx_wire);
-      pipe.send(RADIO_LINK_RX, rx_wire);
+      append_rx_wire(f, rx_batch);
     });
+    if (!rx_batch.empty()) {
+      pipe.send_raw(rx_batch);
+    }
     for (const auto &resp : addba_responses) {
       /* transmit() triggers MtkDevice::snoop_tx_ba() -> mcu_register_peer + mcu_set_rx_ba. */
-      dev.transmit(resp.data(), resp.size(), 6u);
+      if (dev.transmit(resp.data(), resp.size(), 6u, false)) tx_sent++;
     }
+    dev.kick_tx();
 
     /* Drain queued unicast Data frames: only hold when peer's schedule explicitly
      * says Away on another channel (never gate on Doze, which breaks discovery). */
@@ -433,13 +450,21 @@ int main(int argc, char **argv) {
       if (!gate_closed) {
         while (!unicast_q.empty()) {
           const auto &q = unicast_q.front();
-          dev.transmit(q.frame.data(), q.frame.size(), q.params);
+          if (!dev.transmit(q.frame.data(), q.frame.size(), q.params, false)) break;
           unicast_q.pop_front();
+          tx_sent++;
         }
+        dev.kick_tx();
       }
     }
 
-    if (got == 0 && local.empty()) Sleep(1);
+    if (got > 0 || !local.empty() || tx_sent > 0) {
+      last_active_us = now_us();
+    } else if (now_us() - last_active_us < kSpinWindowUs) {
+      SwitchToThread();
+    } else {
+      Sleep(1);
+    }
   }
 
   if (reader.joinable()) reader.join();

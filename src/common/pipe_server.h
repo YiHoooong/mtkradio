@@ -108,8 +108,16 @@ public:
     return write_all(_out.data(), static_cast<DWORD>(_out.size()));
   }
 
+  /* Writes a pre-framed batch of radio_link messages in one system call. */
+  bool send_raw(std::span<const uint8_t> bytes) {
+    if (!_connected) return false;
+    if (bytes.empty()) return true;
+    std::lock_guard<std::mutex> lock(_write_mutex);
+    return write_all(bytes.data(), static_cast<DWORD>(bytes.size()));
+  }
+
 private:
-  static constexpr DWORD kBufferBytes = 1 << 16;
+  static constexpr DWORD kBufferBytes = 1 << 19; /* 512 KiB for batched A-MPDU bursts */
   static constexpr DWORD kStopPollMs = 100;
 
   bool disconnect() {

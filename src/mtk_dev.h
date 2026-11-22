@@ -79,10 +79,13 @@ public:
   bool set_channel(uint8_t channel, unsigned width_mhz);
   bool set_address(const uint8_t address[6]);
 
-  /* Injects a raw 802.11 frame (no FCS) with explicit TX rate / HT MCS / NO_ACK parameters. */
-  bool transmit(const uint8_t *frame, size_t len, const TxParams &params);
+  /* Injects a raw 802.11 frame (no FCS) with explicit TX rate / HT MCS / NO_ACK parameters.
+   * Pass kick=false when enqueueing a batch, then call kick_tx() once to ring the WFDMA doorbell. */
+  bool transmit(const uint8_t *frame, size_t len, const TxParams &params, bool kick = true);
   /* Convenience overload for fixed legacy OFDM rate (e.g. 6 or 24 Mbps). */
-  bool transmit(const uint8_t *frame, size_t len, unsigned rate_mbps = 6);
+  bool transmit(const uint8_t *frame, size_t len, unsigned rate_mbps = 6, bool kick = true);
+  /* Flushes deferred TX ring CIDX doorbell write (one BAR0 MMIO write per batch). */
+  void kick_tx();
 
   /* Polls RX data + MCU rings and invokes `on_rx` for each received 802.11 frame. */
   size_t poll(const RxHandler &on_rx);
@@ -186,6 +189,7 @@ private:
   std::array<uint8_t, 6> _mac{};
   bool _verbose = false;
   bool _dma_running = false;
+  bool _tx_pending_kick = false;
   bool _fw_loaded = false;
   bool _rx_path_set = false;
 

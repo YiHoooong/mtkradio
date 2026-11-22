@@ -387,6 +387,7 @@ bool MtkDevice::dma_disable(bool force, std::string &error) {
     set(MT_WFDMA0_RST, MT_WFDMA0_RST_DMASHDL_ALL_RST | MT_WFDMA0_RST_LOGIC_RST);
   }
   _dma_running = false;
+  _tx_pending_kick = false;
   return true;
 }
 
@@ -1801,14 +1802,21 @@ void MtkDevice::snoop_tx_ba(const uint8_t *frame, size_t len) {
 /* --------------------------------------------------------------------------
  * Raw 802.11 TX & RX Data Path
  * -------------------------------------------------------------------------- */
-bool MtkDevice::transmit(const uint8_t *frame, size_t len, unsigned rate_mbps) {
+bool MtkDevice::transmit(const uint8_t *frame, size_t len, unsigned rate_mbps, bool kick) {
   TxParams params{};
   params.is_ht = false;
   params.rate_mbps = static_cast<uint8_t>(rate_mbps);
-  return transmit(frame, len, params);
+  return transmit(frame, len, params, kick);
 }
 
-bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &params) {
+void MtkDevice::kick_tx() {
+  if (_dma_running && _tx_pending_kick) {
+    wr(_tx_data.reg_base + 0x8, _tx_data.head);
+    _tx_pending_kick = false;
+  }
+}
+
+bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &params, bool kick) {
   if (!_dma_running || !frame || len < 16 || len > DmaPool32::kPageBytes) return false;
 
   /* Configure hardware RX Block Ack before transmitting ADDBA Response / DELBA. */
@@ -1828,6 +1836,8 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   const bool multicast = (frame[4] & 1u) != 0;
   const bool no_ack = multicast || params.no_ack;
   const size_t hdr_len = ieee80211_hdrlen(fc);
+  const uint8_t tid =
+      (fc_type == 2u && (fc_stype & 0x8u) && len >= 26) ? static_cast<uint8_t>(frame[24] & 0x07u) : 0u;
 
   auto *txwi = reinterpret_cast<uint32_t *>(_tx_data.txwi[idx].va);
   std::memset(txwi, 0, MT_TXD_SIZE + sizeof(MtkHwTxp));
@@ -1839,6 +1849,7 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   txwi[1] = MT_TXD1_LONG_FORMAT |
             field_prep(MT_TXD1_WLAN_IDX, 0) |
             field_prep(MT_TXD1_OWN_MAC, 0) |
+            field_prep(MT_TXD1_TID, tid) |
             field_prep(MT_TXD1_HDR_FORMAT, MT_HDR_FORMAT_802_11) |
             field_prep(MT_TXD1_HDR_INFO, static_cast<uint32_t>(hdr_len / 2));
   txwi[2] = field_prep(MT_TXD2_FRAME_TYPE, fc_type) |
@@ -1878,7 +1889,12 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   plat::mem_barrier();
 
   _tx_data.head = next;
-  wr(_tx_data.reg_base + 0x8, _tx_data.head);
+  if (kick) {
+    wr(_tx_data.reg_base + 0x8, _tx_data.head);
+    _tx_pending_kick = false;
+  } else {
+    _tx_pending_kick = true;
+  }
   return true;
 }
 
@@ -1954,7 +1970,7 @@ size_t MtkDevice::poll(const RxHandler &on_rx) {
     for (int budget = 0; budget < 256; budget++) {
       if (!rx_ring_pop(ring, _rx_pkt_buf, false)) break;
       uncommited++;
-      if (uncommited >= 16) {
+      if (uncommited >= 32) {
         rx_ring_commit(ring);
         uncommited = 0;
       }
@@ -1992,6 +2008,7 @@ void MtkDevice::close() {
     (void)wfsys_reset(err);
   }
   _dma_running = false;
+  _tx_pending_kick = false;
   _fw_loaded = false;
   _peers.fill(PeerEntry{});
   _pending_addba.fill(PendingAddba{});
