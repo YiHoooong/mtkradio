@@ -29,9 +29,11 @@ struct RxFrame {
 
 struct TxParams {
   bool is_ht = false;
-  uint8_t rate_mbps = 6; /* Legacy OFDM Mbps (6..54) when !is_ht */
-  uint8_t mcs = 0;       /* HT MCS (0..15) when is_ht */
-  bool sgi = false;      /* Short GI when is_ht */
+  bool is_vht = false;
+  uint8_t rate_mbps = 6; /* Legacy OFDM Mbps (6..54) when !is_ht && !is_vht */
+  uint8_t mcs = 0;       /* HT MCS (0..15) or VHT MCS (0..9) */
+  uint8_t nss = 1;       /* Spatial streams (1..2) when is_vht */
+  bool sgi = false;      /* Short GI when is_ht || is_vht */
   uint8_t bw = 0;        /* 0 = 20 MHz, 1 = 40 MHz, 2 = 80 MHz */
   bool no_ack = false;   /* IEEE80211_RADIOTAP_F_TX_NOACK (0x0008) */
 };
@@ -154,6 +156,8 @@ private:
   bool mcu_register_peer(uint8_t wcid, const uint8_t mac[6]);
   bool mcu_set_rx_ba(uint8_t wcid, const uint8_t mac[6], uint8_t tid, uint16_t ssn,
                      uint16_t winsize, bool amsdu, bool enable);
+  bool mcu_set_tx_ba(uint8_t wcid, const uint8_t mac[6], uint8_t tid, uint16_t ssn,
+                     uint16_t winsize, bool amsdu, bool enable);
   void snoop_rx_ba(const uint8_t *frame, size_t len);
   void snoop_tx_ba(const uint8_t *frame, size_t len);
 
@@ -162,6 +166,7 @@ private:
   struct PeerEntry {
     bool in_use = false;
     std::array<uint8_t, 6> mac{};
+    std::array<bool, 8> tx_ba_active{};
     uint64_t last_used_ms = 0;
   };
   struct PendingAddba {
@@ -202,6 +207,7 @@ private:
 
   std::array<PeerEntry, MT792X_WTBL_RESERVED> _peers{}; /* slots 1..18 */
   std::array<PendingAddba, 32> _pending_addba{};
+  std::array<PendingAddba, 32> _pending_tx_addba{};
   std::vector<uint8_t> _rx_pkt_buf;
 };
 

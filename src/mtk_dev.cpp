@@ -88,6 +88,15 @@ uint16_t ht_rate_val(uint8_t mcs) {
                                field_prep(MT_TX_RATE_IDX, m));
 }
 
+/* Map VHT MCS (0..9) + NSS (1..2) to MT76 Connac2 TX rate encoding. */
+uint16_t vht_rate_val(uint8_t mcs, uint8_t nss) {
+  const uint8_t m = (mcs <= 9u) ? mcs : 7u;
+  const uint8_t n = (nss >= 1u && nss <= 2u) ? static_cast<uint8_t>(nss - 1u) : 0u;
+  return static_cast<uint16_t>(field_prep(MT_TX_RATE_MODE, MT_PHY_TYPE_VHT) |
+                               field_prep(MT_TX_RATE_NSS, n) |
+                               field_prep(MT_TX_RATE_IDX, m));
+}
+
 inline uint16_t read_le16(const uint8_t *p) {
   return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
 }
@@ -147,35 +156,37 @@ bool parse_tx_radiotap(const uint8_t *buf, size_t len, const uint8_t *&frame, si
     pos += 4;
   }
 
-  /* Standard radiotap field (align, size) table for bits 0..19. */
+  /* Standard radiotap field (align, size) table for bits 0..21. */
   struct RtField {
     uint8_t align;
     uint8_t size;
   };
-  static constexpr RtField kFields[20] = {
-      {8, 8}, /* 0: TSFT */
-      {1, 1}, /* 1: FLAGS */
-      {1, 1}, /* 2: RATE (500 kbps units) */
-      {2, 4}, /* 3: CHANNEL */
-      {2, 2}, /* 4: FHSS */
-      {1, 1}, /* 5: DBM_ANTSIGNAL */
-      {1, 1}, /* 6: DBM_ANTNOISE */
-      {2, 2}, /* 7: LOCK_QUALITY */
-      {2, 2}, /* 8: TX_ATTENUATION */
-      {2, 2}, /* 9: DB_TX_ATTENUATION */
-      {1, 1}, /* 10: DBM_TX_POWER */
-      {1, 1}, /* 11: ANTENNA */
-      {1, 1}, /* 12: DB_ANTSIGNAL */
-      {1, 1}, /* 13: DB_ANTNOISE */
-      {2, 2}, /* 14: RX_FLAGS */
-      {2, 2}, /* 15: TX_FLAGS */
-      {1, 1}, /* 16: RTS_RETRIES */
-      {1, 1}, /* 17: DATA_RETRIES */
-      {4, 8}, /* 18: XCHANNEL */
-      {1, 3}, /* 19: MCS */
+  static constexpr RtField kFields[22] = {
+      {8, 8},  /* 0: TSFT */
+      {1, 1},  /* 1: FLAGS */
+      {1, 1},  /* 2: RATE (500 kbps units) */
+      {2, 4},  /* 3: CHANNEL */
+      {2, 2},  /* 4: FHSS */
+      {1, 1},  /* 5: DBM_ANTSIGNAL */
+      {1, 1},  /* 6: DBM_ANTNOISE */
+      {2, 2},  /* 7: LOCK_QUALITY */
+      {2, 2},  /* 8: TX_ATTENUATION */
+      {2, 2},  /* 9: DB_TX_ATTENUATION */
+      {1, 1},  /* 10: DBM_TX_POWER */
+      {1, 1},  /* 11: ANTENNA */
+      {1, 1},  /* 12: DB_ANTSIGNAL */
+      {1, 1},  /* 13: DB_ANTNOISE */
+      {2, 2},  /* 14: RX_FLAGS */
+      {2, 2},  /* 15: TX_FLAGS */
+      {1, 1},  /* 16: RTS_RETRIES */
+      {1, 1},  /* 17: DATA_RETRIES */
+      {4, 8},  /* 18: XCHANNEL */
+      {1, 3},  /* 19: MCS */
+      {4, 8},  /* 20: A-MPDU STATUS */
+      {2, 12}, /* 21: VHT */
   };
 
-  for (unsigned b = 0; b < 20; b++) {
+  for (unsigned b = 0; b < 22; b++) {
     if (!(present0 & (1u << b))) continue;
     const size_t align = kFields[b].align;
     const size_t sz = kFields[b].size;
@@ -186,6 +197,7 @@ bool parse_tx_radiotap(const uint8_t *buf, size_t len, const uint8_t *&frame, si
       const uint8_t r500 = buf[pos];
       if (r500 > 0) {
         params.is_ht = false;
+        params.is_vht = false;
         params.rate_mbps = static_cast<uint8_t>(r500 / 2u);
       }
     } else if (b == 15) { /* TX_FLAGS */
@@ -197,9 +209,29 @@ bool parse_tx_radiotap(const uint8_t *buf, size_t len, const uint8_t *&frame, si
       const uint8_t mcs = buf[pos + 2];
       if ((known & 0x02u) && mcs <= 15u) {
         params.is_ht = true;
+        params.is_vht = false;
         params.mcs = mcs;
         if (known & 0x04u) params.sgi = (flags & 0x04u) != 0;
         if (known & 0x01u) params.bw = ((flags & 0x03u) == 1u) ? 1u : 0u;
+      }
+    } else if (b == 21) { /* VHT */
+      const uint16_t known = read_le16(buf + pos);
+      const uint8_t flags = buf[pos + 2];
+      const uint8_t bw_raw = buf[pos + 3];
+      const uint8_t mcs_nss0 = buf[pos + 4];
+      const uint8_t nss = static_cast<uint8_t>(mcs_nss0 & 0x0fu);
+      const uint8_t mcs = static_cast<uint8_t>((mcs_nss0 >> 4) & 0x0fu);
+      if (nss >= 1u && mcs <= 9u) {
+        params.is_vht = true;
+        params.is_ht = false;
+        params.mcs = mcs;
+        params.nss = (nss > 2u) ? 2u : nss;
+        if (known & 0x0004u) params.sgi = (flags & 0x04u) != 0;
+        if (known & 0x0040u) {
+          if (bw_raw == 4u) params.bw = 2u;      /* 80 MHz */
+          else if (bw_raw == 1u) params.bw = 1u; /* 40 MHz */
+          else params.bw = 0u;                   /* 20 MHz */
+        }
       }
     }
     pos += sz;
@@ -1122,6 +1154,7 @@ bool MtkDevice::set_address(const uint8_t address[6]) {
   if (std::memcmp(_mac.data(), address, 6) != 0) {
     _peers.fill(PeerEntry{});
     _pending_addba.fill(PendingAddba{});
+    _pending_tx_addba.fill(PendingAddba{});
   }
   std::memcpy(_mac.data(), address, 6);
 
@@ -1257,7 +1290,7 @@ bool MtkDevice::set_address(const uint8_t address[6]) {
   for (int ac = 0; ac < 4; ac++) {
     edca_req.edca[ac].cw_min = 3;
     edca_req.edca[ac].cw_max = 7;
-    edca_req.edca[ac].txop = 0;
+    edca_req.edca[ac].txop = 94; /* ~3 ms (94 * 32 us) for back-to-back A-MPDU bursts */
     edca_req.edca[ac].aifs = 2;
   }
   edca_req.bss_idx = 0;
@@ -1562,6 +1595,7 @@ int MtkDevice::get_or_add_peer_wcid(const uint8_t mac[6]) {
 
   _peers[chosen].in_use = true;
   std::memcpy(_peers[chosen].mac.data(), mac, 6);
+  _peers[chosen].tx_ba_active.fill(false);
   _peers[chosen].last_used_ms = now_ms();
   log("registered AWDL peer wcid=" + std::to_string(chosen) + " mac=" + mac_str(mac));
   return chosen;
@@ -1691,6 +1725,140 @@ bool MtkDevice::mcu_set_rx_ba(uint8_t wcid, const uint8_t mac[6], uint8_t tid, u
   return true;
 }
 
+bool MtkDevice::mcu_set_tx_ba(uint8_t wcid, const uint8_t mac[6], uint8_t tid, uint16_t ssn,
+                              uint16_t winsize, bool amsdu, bool enable) {
+  if (wcid == 0 || wcid >= MT792X_WTBL_RESERVED || tid >= 8) return false;
+
+#pragma pack(push, 1)
+  struct WtblBaMsg {
+    /* sta_req_hdr (8 B) */
+    uint8_t bss_idx;
+    uint8_t wlan_idx_lo;
+    uint16_t tlv_num;
+    uint8_t is_tlv_append;
+    uint8_t muar_idx;
+    uint8_t wlan_idx_hi;
+    uint8_t rsv0;
+
+    /* STA_REC_WTBL outer TLV header (4 B) */
+    uint16_t wtbl_tlv_tag;
+    uint16_t wtbl_tlv_len;
+
+    /* wtbl_req_hdr (8 B) */
+    uint8_t wtbl_wlan_idx_lo;
+    uint8_t wtbl_operation;
+    uint16_t wtbl_tlv_num;
+    uint8_t wtbl_wlan_idx_hi;
+    uint8_t wtbl_rsv[3];
+
+    /* wtbl_ba (28 B) */
+    uint16_t ba_tag;
+    uint16_t ba_len;
+    uint8_t ba_tid;
+    uint8_t ba_type;
+    uint8_t ba_rsv0[2];
+    uint16_t ba_sn;
+    uint8_t ba_en;
+    uint8_t ba_winsize_idx;
+    uint16_t ba_winsize;
+    uint8_t peer_addr[6];
+    uint8_t rst_ba_tid;
+    uint8_t rst_ba_sel;
+    uint8_t rst_ba_sb;
+    uint8_t band_idx;
+    uint8_t ba_rsv1[4];
+  };
+
+  struct StaRecBaMsg {
+    /* sta_req_hdr (8 B) */
+    uint8_t bss_idx;
+    uint8_t wlan_idx_lo;
+    uint16_t tlv_num;
+    uint8_t is_tlv_append;
+    uint8_t muar_idx;
+    uint8_t wlan_idx_hi;
+    uint8_t rsv0;
+
+    /* sta_rec_ba (12 B) */
+    uint16_t ba_tag;
+    uint16_t ba_len;
+    uint8_t ba_tid;
+    uint8_t ba_type;
+    uint8_t ba_amsdu;
+    uint8_t ba_en;
+    uint16_t ba_ssn;
+    uint16_t ba_winsize;
+  };
+#pragma pack(pop)
+  static_assert(sizeof(WtblBaMsg) == 48, "WtblBaMsg must be 48 bytes");
+  static_assert(sizeof(StaRecBaMsg) == 20, "StaRecBaMsg must be 20 bytes");
+
+  static constexpr uint8_t kBaRange[8] = {4, 8, 12, 24, 36, 48, 54, 64};
+  uint8_t winsize_idx = 0;
+  if (enable) {
+    for (int i = 7; i > 0; i--) {
+      if (winsize >= kBaRange[i]) {
+        winsize_idx = static_cast<uint8_t>(i);
+        break;
+      }
+    }
+  }
+
+  /* Msg 1: STA_REC_WTBL + WTBL_BA (Originator, 48 B) */
+  WtblBaMsg msg1{};
+  msg1.bss_idx = 0;
+  msg1.wlan_idx_lo = wcid;
+  msg1.tlv_num = 1;
+  msg1.is_tlv_append = 1;
+  msg1.wtbl_tlv_tag = STA_REC_WTBL;
+  msg1.wtbl_tlv_len = 40; /* 4 + 8 + 28 */
+  msg1.wtbl_wlan_idx_lo = wcid;
+  msg1.wtbl_operation = WTBL_SET;
+  msg1.wtbl_tlv_num = 1;
+  msg1.ba_tag = WTBL_BA;
+  msg1.ba_len = 28;
+  msg1.ba_tid = tid;
+  msg1.ba_type = MT_BA_TYPE_ORIGINATOR;
+  msg1.ba_sn = ssn;
+  msg1.ba_en = enable ? 1u : 0u;
+  msg1.ba_winsize_idx = winsize_idx;
+  msg1.ba_winsize = enable ? winsize : 0u;
+
+  if (!mcu_send_uni(MCU_UNI_CMD_STA_REC_UPDATE, &msg1, sizeof(msg1), true)) {
+    log("WARNING: TX WTBL_BA update failed for wcid=" + std::to_string(wcid) + " tid=" +
+        std::to_string(tid));
+    return false;
+  }
+
+  /* Msg 2: STA_REC_BA (Originator, 20 B) */
+  StaRecBaMsg msg2{};
+  msg2.bss_idx = 0;
+  msg2.wlan_idx_lo = wcid;
+  msg2.tlv_num = 1;
+  msg2.is_tlv_append = 1;
+  msg2.ba_tag = STA_REC_BA;
+  msg2.ba_len = 12;
+  msg2.ba_tid = tid;
+  msg2.ba_type = MT_BA_TYPE_ORIGINATOR;
+  msg2.ba_amsdu = amsdu ? 1u : 0u;
+  msg2.ba_en = enable ? static_cast<uint8_t>(1u << tid) : 0u;
+  msg2.ba_ssn = ssn;
+  msg2.ba_winsize = winsize;
+
+  if (!mcu_send_uni(MCU_UNI_CMD_STA_REC_UPDATE, &msg2, sizeof(msg2), true)) {
+    log("WARNING: TX STA_REC_BA update failed for wcid=" + std::to_string(wcid) + " tid=" +
+        std::to_string(tid));
+    return false;
+  }
+
+  _peers[wcid].tx_ba_active[tid] = enable;
+  log(std::string(enable ? "HW TX BA enabled" : "HW TX BA disabled") + " wcid=" +
+      std::to_string(wcid) + " peer=" + mac_str(mac) + " tid=" + std::to_string(tid) +
+      " ssn=" + std::to_string(ssn) + " win=" + std::to_string(winsize) +
+      " amsdu=" + std::to_string(amsdu ? 1 : 0));
+  return true;
+}
+
 void MtkDevice::snoop_rx_ba(const uint8_t *frame, size_t len) {
   if (len < 24 || (frame[0] & 0xfcu) != 0xd0u) return; /* Management Action only */
   if (std::memcmp(frame + 4, _mac.data(), 6) != 0) return; /* DA must be us */
@@ -1703,7 +1871,7 @@ void MtkDevice::snoop_rx_ba(const uint8_t *frame, size_t len) {
   if (body[0] != 3u) return; /* Category 3 = Block Ack */
   const uint8_t *peer_mac = frame + 10; /* SA */
 
-  if (body[1] == 0u && len >= hdr_len + 9) { /* ADDBA Request */
+  if (body[1] == 0u && len >= hdr_len + 9) { /* Incoming ADDBA Request -> RX BA */
     const uint8_t token = body[2];
     const uint16_t params = read_le16(body + 3);
     const bool amsdu = (params & 1u) != 0;
@@ -1737,14 +1905,42 @@ void MtkDevice::snoop_rx_ba(const uint8_t *frame, size_t len) {
     dst.ssn = ssn;
     dst.amsdu = amsdu;
     dst.ts_ms = now_ms();
+  } else if (body[1] == 1u && len >= hdr_len + 9) { /* Incoming ADDBA Response -> TX BA */
+    const uint16_t status = read_le16(body + 3);
+    if (status != 0u) return;
+
+    const uint8_t token = body[2];
+    const uint16_t params = read_le16(body + 5);
+    const uint8_t tid = static_cast<uint8_t>((params >> 2) & 0x0fu);
+    const uint16_t raw_win = static_cast<uint16_t>((params >> 6) & 0x03ffu);
+    const uint16_t winsize = std::clamp<uint16_t>(raw_win, 1u, 64u);
+
+    uint16_t ssn = 0;
+    bool amsdu = (params & 1u) != 0;
+    for (auto &e : _pending_tx_addba) {
+      if (e.valid && e.tid == tid && e.token == token &&
+          std::memcmp(e.peer_mac.data(), peer_mac, 6) == 0) {
+        ssn = e.ssn;
+        amsdu = amsdu && e.amsdu;
+        e.valid = false;
+        break;
+      }
+    }
+
+    const int wcid = get_or_add_peer_wcid(peer_mac);
+    if (wcid > 0) {
+      (void)mcu_set_tx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, ssn, winsize, amsdu, true);
+    }
   } else if (body[1] == 2u && len >= hdr_len + 6) { /* DELBA */
     const uint16_t params = read_le16(body + 2);
     const uint8_t initiator = static_cast<uint8_t>((params >> 11) & 1u);
     const uint8_t tid = static_cast<uint8_t>((params >> 12) & 0x0fu);
-    if (initiator == 1u) {
-      const int wcid = find_peer_wcid(peer_mac);
-      if (wcid > 0) {
+    const int wcid = find_peer_wcid(peer_mac);
+    if (wcid > 0) {
+      if (initiator == 1u) {
         (void)mcu_set_rx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, 0, 0, false, false);
+      } else {
+        (void)mcu_set_tx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, 0, 0, false, false);
       }
     }
   }
@@ -1760,7 +1956,41 @@ void MtkDevice::snoop_tx_ba(const uint8_t *frame, size_t len) {
   if (body[0] != 3u) return; /* Category 3 = Block Ack */
   const uint8_t *peer_mac = frame + 4; /* DA */
 
-  if (body[1] == 1u && len >= hdr_len + 9) { /* ADDBA Response */
+  if (body[1] == 0u && len >= hdr_len + 9) { /* Outgoing ADDBA Request -> track for TX BA */
+    const uint8_t token = body[2];
+    const uint16_t params = read_le16(body + 3);
+    const bool amsdu = (params & 1u) != 0;
+    const uint8_t tid = static_cast<uint8_t>((params >> 2) & 0x0fu);
+    const uint16_t ssn = static_cast<uint16_t>((read_le16(body + 7) >> 4) & 0x0fffu);
+
+    size_t slot = 0;
+    uint64_t oldest_ts = ~0ULL;
+    for (size_t i = 0; i < _pending_tx_addba.size(); i++) {
+      const auto &e = _pending_tx_addba[i];
+      if (e.valid && e.tid == tid && e.token == token &&
+          std::memcmp(e.peer_mac.data(), peer_mac, 6) == 0) {
+        slot = i;
+        break;
+      }
+      if (!e.valid) {
+        slot = i;
+        oldest_ts = 0;
+        break;
+      }
+      if (e.ts_ms < oldest_ts) {
+        oldest_ts = e.ts_ms;
+        slot = i;
+      }
+    }
+    auto &dst = _pending_tx_addba[slot];
+    dst.valid = true;
+    std::memcpy(dst.peer_mac.data(), peer_mac, 6);
+    dst.tid = tid;
+    dst.token = token;
+    dst.ssn = ssn;
+    dst.amsdu = amsdu;
+    dst.ts_ms = now_ms();
+  } else if (body[1] == 1u && len >= hdr_len + 9) { /* Outgoing ADDBA Response -> RX BA */
     const uint16_t status = read_le16(body + 3);
     if (status != 0u) return;
 
@@ -1786,14 +2016,16 @@ void MtkDevice::snoop_tx_ba(const uint8_t *frame, size_t len) {
     if (wcid > 0) {
       (void)mcu_set_rx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, ssn, winsize, amsdu, true);
     }
-  } else if (body[1] == 2u && len >= hdr_len + 6) { /* DELBA */
+  } else if (body[1] == 2u && len >= hdr_len + 6) { /* Outgoing DELBA */
     const uint16_t params = read_le16(body + 2);
     const uint8_t initiator = static_cast<uint8_t>((params >> 11) & 1u);
     const uint8_t tid = static_cast<uint8_t>((params >> 12) & 0x0fu);
-    if (initiator == 0u) {
-      const int wcid = find_peer_wcid(peer_mac);
-      if (wcid > 0) {
+    const int wcid = find_peer_wcid(peer_mac);
+    if (wcid > 0) {
+      if (initiator == 0u) {
         (void)mcu_set_rx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, 0, 0, false, false);
+      } else {
+        (void)mcu_set_tx_ba(static_cast<uint8_t>(wcid), peer_mac, tid, 0, 0, false, false);
       }
     }
   }
@@ -1836,8 +2068,18 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   const bool multicast = (frame[4] & 1u) != 0;
   const bool no_ack = multicast || params.no_ack;
   const size_t hdr_len = ieee80211_hdrlen(fc);
+  const bool is_qos_data = (frame[0] & 0xfcu) == 0x88u;
   const uint8_t tid =
-      (fc_type == 2u && (fc_stype & 0x8u) && len >= 26) ? static_cast<uint8_t>(frame[24] & 0x07u) : 0u;
+      (is_qos_data && len >= 26) ? static_cast<uint8_t>(frame[24] & 0x07u) : 0u;
+  uint32_t wlan_idx = 0;
+  bool use_tx_ba = false;
+  if (is_qos_data && !multicast && !no_ack) {
+    const int peer_wcid = find_peer_wcid(frame + 4);
+    if (peer_wcid > 0 && _peers[peer_wcid].tx_ba_active[tid]) {
+      wlan_idx = static_cast<uint32_t>(peer_wcid);
+      use_tx_ba = true;
+    }
+  }
 
   auto *txwi = reinterpret_cast<uint32_t *>(_tx_data.txwi[idx].va);
   std::memset(txwi, 0, MT_TXD_SIZE + sizeof(MtkHwTxp));
@@ -1847,7 +2089,7 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
             field_prep(MT_TXD0_PKT_FMT, MT_TX_TYPE_CT) |
             field_prep(MT_TXD0_Q_IDX, q_idx);
   txwi[1] = MT_TXD1_LONG_FORMAT |
-            field_prep(MT_TXD1_WLAN_IDX, 0) |
+            field_prep(MT_TXD1_WLAN_IDX, wlan_idx) |
             field_prep(MT_TXD1_OWN_MAC, 0) |
             field_prep(MT_TXD1_TID, tid) |
             field_prep(MT_TXD1_HDR_FORMAT, MT_HDR_FORMAT_802_11) |
@@ -1857,11 +2099,16 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
             field_prep(MT_TXD2_MULTICAST, multicast ? 1u : 0u) |
             MT_TXD2_FIX_RATE | MT_TXD2_HTC_VLD;
   txwi[3] = field_prep(MT_TXD3_REM_TX_COUNT, no_ack ? 1u : 7u) |
-            MT_TXD3_BA_DISABLE | MT_TXD3_SN_VALID |
+            (use_tx_ba ? 0u : MT_TXD3_BA_DISABLE) | MT_TXD3_SN_VALID |
             field_prep(MT_TXD3_SEQ, (sc >> 4) & 0xfffu) |
             (no_ack ? MT_TXD3_NO_ACK : 0u);
-  if (params.is_ht) {
-    txwi[6] = MT_TXD6_FIXED_BW |
+  if (params.is_vht) {
+    txwi[6] = MT_TXD6_FIXED_BW | MT_TXD6_LDPC |
+              field_prep(MT_TXD6_BW, params.bw) |
+              field_prep(MT_TXD6_SGI, params.sgi ? 1u : 0u) |
+              field_prep(MT_TXD6_TX_RATE, vht_rate_val(params.mcs, params.nss));
+  } else if (params.is_ht) {
+    txwi[6] = MT_TXD6_FIXED_BW | MT_TXD6_LDPC |
               field_prep(MT_TXD6_BW, params.bw) |
               field_prep(MT_TXD6_SGI, params.sgi ? 1u : 0u) |
               field_prep(MT_TXD6_TX_RATE, ht_rate_val(params.mcs));
@@ -2012,6 +2259,7 @@ void MtkDevice::close() {
   _fw_loaded = false;
   _peers.fill(PeerEntry{});
   _pending_addba.fill(PendingAddba{});
+  _pending_tx_addba.fill(PendingAddba{});
 }
 
 } // namespace mtk

@@ -357,6 +357,7 @@ constexpr uint32_t MT_TXD5_PID = genmask(7, 0);
 
 constexpr uint32_t MT_TXD6_TX_RATE = genmask(29, 16);
 constexpr uint32_t MT_TXD6_SGI = genmask(15, 14);
+constexpr uint32_t MT_TXD6_LDPC = bit(11);
 constexpr uint32_t MT_TXD6_FIXED_BW = bit(2);
 constexpr uint32_t MT_TXD6_BW = genmask(1, 0);
 
@@ -370,6 +371,7 @@ constexpr uint32_t MT_TX_RATE_MODE = genmask(9, 6);
 constexpr uint32_t MT_TX_RATE_IDX = genmask(5, 0);
 constexpr uint32_t MT_PHY_TYPE_OFDM = 1;
 constexpr uint32_t MT_PHY_TYPE_HT = 2;
+constexpr uint32_t MT_PHY_TYPE_VHT = 4;
 
 /* Hardware TXP (mt76_connac.h struct mt76_connac_hw_txp) */
 constexpr uint16_t MT_MSDU_ID_VALID = 0x8000u;
@@ -529,6 +531,7 @@ constexpr uint16_t WTBL_HT = 2;
 constexpr uint16_t WTBL_VHT = 3;
 constexpr uint16_t WTBL_HDR_TRANS = 6;
 constexpr uint16_t WTBL_BA = 8;
+constexpr uint8_t MT_BA_TYPE_ORIGINATOR = 1;
 constexpr uint8_t MT_BA_TYPE_RECIPIENT = 2;
 constexpr uint8_t RST_BA_MAC_TID_MATCH = 0;
 
