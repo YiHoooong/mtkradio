@@ -408,29 +408,27 @@ int main(int argc, char **argv) {
       dev.transmit(resp.data(), resp.size(), 6u);
     }
 
-    /* Drain queued unicast Data frames when peer's AWDL window is open. */
+    /* Drain queued unicast Data frames: only hold when peer's schedule explicitly
+     * says Away on another channel (never gate on Doze, which breaks discovery). */
     if (!unicast_q.empty()) {
       const uint64_t now = now_us();
       bool gate_closed = false;
       if (have_sched_peer && sched.known() && sched.fresh(now)) {
-        const bool dozing = sched.presentEntries() <= awdl_sched::kPeerDozeMaxEntries &&
-                            (!sched_rx_us || now - sched_rx_us > 100000);
-        const auto gate = sched.sendGate(now, dozing, 4000);
-        if (gate == awdl_sched::PeerSchedule::SendGate::Open) {
-          gate_since_us = 0;
-          gate_kind = 0;
-        } else {
-          const uint8_t kind = static_cast<uint8_t>(gate);
-          if (!gate_since_us || kind != gate_kind) {
+        const auto gate = sched.sendGate(now, false, 0);
+        if (gate == awdl_sched::PeerSchedule::SendGate::Away) {
+          if (!gate_since_us) {
             gate_since_us = now;
-            gate_kind = kind;
-            gate_limit_us = gate == awdl_sched::PeerSchedule::SendGate::Away
-                                ? sched.pauseLimitUS(now)
-                                : sched.awUS() + 2000;
+            gate_limit_us = sched.pauseLimitUS(now);
+            if (gate_limit_us > 16000) gate_limit_us = 16000;
           }
           if (now - gate_since_us < gate_limit_us) gate_closed = true;
-          else gate_limit_us = 0;
+        } else {
+          gate_since_us = 0;
+          gate_limit_us = 0;
         }
+      } else {
+        gate_since_us = 0;
+        gate_limit_us = 0;
       }
       if (!gate_closed) {
         while (!unicast_q.empty()) {
