@@ -30,6 +30,9 @@
 #include <vector>
 
 #include "mtk_dev.h"
+#include "awdl_policy.h"
+#include "awdl_schedule.h"
+#include "plat.h"
 #include "pipe_server.h"
 #include "radio_link.h"
 
@@ -247,6 +250,26 @@ int main(int argc, char **argv) {
   std::memcpy(own_mac.data(), default_mac, 6);
   uint16_t mgmt_seq = 0;
 
+  /* Peer AWDL schedule & country/channel learning (reused from iwxradio). */
+  awdl_sched::PeerSchedule sched{};
+  sched.assumeZero = true;
+  uint8_t sched_peer[6] = {};
+  bool have_sched_peer = false;
+  uint64_t sched_rx_us = 0;
+  uint64_t gate_since_us = 0;
+  uint64_t gate_limit_us = 0;
+  uint8_t gate_kind = 0;
+  uint8_t peer_seq[16] = {};
+  unsigned peer5g = 0;
+  awdl::PeerCountry peer_country;
+
+  struct QueuedTx {
+    std::vector<uint8_t> frame;
+    mtk::TxParams params;
+  };
+  constexpr size_t kUnicastQueueMax = 128;
+  std::deque<QueuedTx> unicast_q;
+
   std::vector<uint8_t> rx_wire;
   std::vector<std::array<uint8_t, 33>> addba_responses;
   while (!stopping()) {
@@ -262,11 +285,23 @@ int main(int argc, char **argv) {
         size_t flen = 0;
         mtk::TxParams tx_params{};
         if (mtk::parse_tx_radiotap(c.payload.data(), c.payload.size(), frame, flen, tx_params)) {
-          dev.transmit(frame, flen, tx_params);
+          const bool is_data = (frame[0] & 0x0cu) == 0x08u;
+          const bool is_unicast = flen >= 10 && (frame[4] & 1u) == 0;
+          const bool to_sched_peer = is_data && is_unicast && have_sched_peer &&
+                                     std::memcmp(frame + 4, sched_peer, 6) == 0;
+          if (to_sched_peer && sched.known()) {
+            if (unicast_q.size() >= kUnicastQueueMax) unicast_q.pop_front();
+            unicast_q.push_back({std::vector<uint8_t>(frame, frame + flen), tx_params});
+          } else {
+            dev.transmit(frame, flen, tx_params);
+          }
         }
       } else if (c.type == RADIO_LINK_SET_CHANNEL && c.payload.size() >= 1) {
         const uint8_t ch = c.payload[0];
         dev.set_channel(ch, ch <= 14 ? 20 : width);
+        sched.reset();
+        have_sched_peer = false;
+        gate_since_us = 0;
       } else if (c.type == RADIO_LINK_SET_ADDRESS && c.payload.size() >= 6) {
         std::memcpy(own_mac.data(), c.payload.data(), 6);
         dev.set_address(own_mac.data());
@@ -281,6 +316,52 @@ int main(int argc, char **argv) {
 
     addba_responses.clear();
     const size_t got = dev.poll([&](const mtk::RxFrame &f) {
+      const uint64_t heard = now_us();
+      if (f.len >= 16 && f.channel == dev.channel()) {
+        const uint8_t *from = f.data + 10;
+        const bool is_sched = have_sched_peer && std::memcmp(from, sched_peer, 6) == 0;
+        const bool want = is_sched || !sched.fresh(heard);
+        if (want && awdl::is_awdl_action(f.data, f.len)) {
+          awdl_sched::PeerSyncInfo info{};
+          bool bad = false;
+          if (awdl_sched::peerSyncFromAction(f.data, f.len, &info, &bad)) {
+            if (!is_sched) {
+              sched.reset();
+              std::memcpy(sched_peer, from, 6);
+              have_sched_peer = true;
+              gate_since_us = 0;
+            }
+            sched_rx_us = heard;
+            sched.notePeerFrame(heard);
+            sched.note(info, heard, dev.channel());
+          } else if (is_sched) {
+            if (bad) sched.invalidate();
+            else {
+              sched_rx_us = heard;
+              sched.notePeerFrame(heard);
+            }
+          }
+        } else if (is_sched) {
+          sched_rx_us = heard;
+          sched.notePeerFrame(heard);
+        }
+      }
+      if (awdl::is_awdl_action(f.data, f.len)) {
+        uint8_t seq[16];
+        if (awdl::peer_sequence(f.data, f.len, seq) && std::memcmp(seq, peer_seq, 16) != 0) {
+          std::memcpy(peer_seq, seq, 16);
+          const unsigned ch = awdl::peer_channel(seq);
+          if (ch && ch != peer5g) {
+            peer5g = ch;
+            log_line("event: peer-channel " + std::to_string(ch));
+          }
+        }
+        char cc[3];
+        if (awdl::peer_country(f.data, f.len, cc) && peer_country.note(cc)) {
+          log_line("event: peer-country " + std::string(peer_country.confirmed));
+        }
+      }
+
       /* Auto-answer 802.11 ADDBA Request (awdld/OWL does not send ADDBA Response,
        * so without this MT7922 never activates HW RX BlockAck / A-MPDU). */
       if (!no_block_ack && f.len >= 33 && (f.data[0] & 0xfcu) == 0xd0u &&
@@ -326,6 +407,40 @@ int main(int argc, char **argv) {
       /* transmit() triggers MtkDevice::snoop_tx_ba() -> mcu_register_peer + mcu_set_rx_ba. */
       dev.transmit(resp.data(), resp.size(), 6u);
     }
+
+    /* Drain queued unicast Data frames when peer's AWDL window is open. */
+    if (!unicast_q.empty()) {
+      const uint64_t now = now_us();
+      bool gate_closed = false;
+      if (have_sched_peer && sched.known() && sched.fresh(now)) {
+        const bool dozing = sched.presentEntries() <= awdl_sched::kPeerDozeMaxEntries &&
+                            (!sched_rx_us || now - sched_rx_us > 100000);
+        const auto gate = sched.sendGate(now, dozing, 4000);
+        if (gate == awdl_sched::PeerSchedule::SendGate::Open) {
+          gate_since_us = 0;
+          gate_kind = 0;
+        } else {
+          const uint8_t kind = static_cast<uint8_t>(gate);
+          if (!gate_since_us || kind != gate_kind) {
+            gate_since_us = now;
+            gate_kind = kind;
+            gate_limit_us = gate == awdl_sched::PeerSchedule::SendGate::Away
+                                ? sched.pauseLimitUS(now)
+                                : sched.awUS() + 2000;
+          }
+          if (now - gate_since_us < gate_limit_us) gate_closed = true;
+          else gate_limit_us = 0;
+        }
+      }
+      if (!gate_closed) {
+        while (!unicast_q.empty()) {
+          const auto &q = unicast_q.front();
+          dev.transmit(q.frame.data(), q.frame.size(), q.params);
+          unicast_q.pop_front();
+        }
+      }
+    }
+
     if (got == 0 && local.empty()) Sleep(1);
   }
 
