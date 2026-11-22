@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
   bool probe_only = false;
   bool reset_only = false;
   bool boot_test = false;
+  bool no_block_ack = false;
   uint8_t channel = 149;
   unsigned width = 80;
   mtk::MtkDevice::Options dev_opts;
@@ -133,8 +134,13 @@ int main(int argc, char **argv) {
       dev_opts.firmware_dir = next_val();
     } else if (a == "--verbose") {
       dev_opts.verbose = true;
-    } else if (a[0] != '-') {
-      channel = static_cast<uint8_t>(std::atoi(a.c_str()));
+    } else if (a == "--no-block-ack") {
+      no_block_ack = true;
+    } else if (a == "--country" || a == "--tap" || a == "--profile" || a == "--mac" || a == "--pipe") {
+      (void)next_val(); /* accepted for compatibility with NekoDropService */
+    } else if (!a.empty() && a[0] >= '0' && a[0] <= '9') {
+      const int ch = std::atoi(a.c_str());
+      if (ch > 0 && ch <= 233) channel = static_cast<uint8_t>(ch);
     }
   }
   if (channel <= 14) width = 20;
@@ -237,7 +243,12 @@ int main(int argc, char **argv) {
     }
   });
 
+  std::array<uint8_t, 6> own_mac{};
+  std::memcpy(own_mac.data(), default_mac, 6);
+  uint16_t mgmt_seq = 0;
+
   std::vector<uint8_t> rx_wire;
+  std::vector<std::array<uint8_t, 33>> addba_responses;
   while (!stopping()) {
     /* Process commands from awdld on the radio thread (MtkDevice is single-threaded). */
     std::deque<PendingCmd> local;
@@ -257,7 +268,8 @@ int main(int argc, char **argv) {
         const uint8_t ch = c.payload[0];
         dev.set_channel(ch, ch <= 14 ? 20 : width);
       } else if (c.type == RADIO_LINK_SET_ADDRESS && c.payload.size() >= 6) {
-        dev.set_address(c.payload.data());
+        std::memcpy(own_mac.data(), c.payload.data(), 6);
+        dev.set_address(own_mac.data());
       } else if (c.type == RADIO_LINK_SET_BSSID_FILTER && c.payload.size() >= 6) {
         std::memcpy(bssid_filter.data(), c.payload.data(), 6);
         filter_active = false;
@@ -267,13 +279,51 @@ int main(int argc, char **argv) {
       }
     }
 
+    addba_responses.clear();
     const size_t got = dev.poll([&](const mtk::RxFrame &f) {
+      /* Auto-answer 802.11 ADDBA Request (awdld/OWL does not send ADDBA Response,
+       * so without this MT7922 never activates HW RX BlockAck / A-MPDU). */
+      if (!no_block_ack && f.len >= 33 && (f.data[0] & 0xfcu) == 0xd0u &&
+          std::memcmp(f.data + 4, own_mac.data(), 6) == 0 &&
+          f.data[24] == 3u && f.data[25] == 0u) {
+        const uint8_t token = f.data[26];
+        const uint16_t req_params = static_cast<uint16_t>(f.data[27] | (f.data[28] << 8));
+        const bool immediate = (req_params & 2u) != 0;
+        if (immediate && addba_responses.size() < 8) {
+          const uint16_t amsdu = req_params & 1u;
+          const uint8_t tid = static_cast<uint8_t>((req_params >> 2) & 0x0fu);
+          uint16_t win = static_cast<uint16_t>((req_params >> 6) & 0x03ffu);
+          if (win == 0 || win > 64) win = 64;
+          std::array<uint8_t, 33> resp{};
+          resp[0] = 0xd0u; /* Action */
+          std::memcpy(resp.data() + 4, f.data + 10, 6);  /* DA = peer */
+          std::memcpy(resp.data() + 10, own_mac.data(), 6); /* SA = us */
+          std::memcpy(resp.data() + 16, f.data + 16, 6); /* BSSID */
+          const uint16_t sc = static_cast<uint16_t>((++mgmt_seq) << 4);
+          resp[22] = static_cast<uint8_t>(sc & 0xffu);
+          resp[23] = static_cast<uint8_t>(sc >> 8);
+          resp[24] = 3u; /* Category: Block Ack */
+          resp[25] = 1u; /* Action: ADDBA Response */
+          resp[26] = token;
+          /* 27..28 = Status 0 (Success) */
+          const uint16_t rsp_params = static_cast<uint16_t>(amsdu | 2u | (static_cast<uint16_t>(tid) << 2) | (win << 6));
+          resp[29] = static_cast<uint8_t>(rsp_params & 0xffu);
+          resp[30] = static_cast<uint8_t>(rsp_params >> 8);
+          /* 31..32 = Timeout 0 */
+          addba_responses.push_back(resp);
+        }
+      }
+
       if (!pipe.connected()) return;
       if (filter_active && f.len >= 22 && std::memcmp(f.data + 16, bssid_filter.data(), 6) != 0)
         return;
       build_rx_radiotap(f, rx_wire);
       pipe.send(RADIO_LINK_RX, rx_wire);
     });
+    for (const auto &resp : addba_responses) {
+      /* transmit() triggers MtkDevice::snoop_tx_ba() -> mcu_register_peer + mcu_set_rx_ba. */
+      dev.transmit(resp.data(), resp.size(), 6u);
+    }
     if (got == 0 && local.empty()) Sleep(1);
   }
 
