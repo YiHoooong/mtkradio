@@ -1,0 +1,11 @@
+build/
+out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+mtkradio_linux
+.vs/
+.vscode/
+*.user
+*.log
