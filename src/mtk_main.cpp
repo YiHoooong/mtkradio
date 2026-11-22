@@ -290,7 +290,9 @@ int main(int argc, char **argv) {
         const uint16_t req_params = static_cast<uint16_t>(f.data[27] | (f.data[28] << 8));
         const bool immediate = (req_params & 2u) != 0;
         if (immediate && addba_responses.size() < 8) {
-          const uint16_t amsdu = req_params & 1u;
+          /* awdld/OWL does not parse 802.11 A-MSDU frames; keep bit 0 (A-MSDU) = 0
+           * just like iwxradio/awdl_policy.h so iPhone sends plain A-MPDU. */
+          const uint16_t amsdu = 0u;
           const uint8_t tid = static_cast<uint8_t>((req_params >> 2) & 0x0fu);
           uint16_t win = static_cast<uint16_t>((req_params >> 6) & 0x03ffu);
           if (win == 0 || win > 64) win = 64;

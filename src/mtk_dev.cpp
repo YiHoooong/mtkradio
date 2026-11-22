@@ -1775,7 +1775,7 @@ void MtkDevice::snoop_tx_ba(const uint8_t *frame, size_t len) {
       if (e.valid && e.tid == tid && e.token == token &&
           std::memcmp(e.peer_mac.data(), peer_mac, 6) == 0) {
         ssn = e.ssn;
-        amsdu = e.amsdu;
+        amsdu = amsdu && e.amsdu;
         e.valid = false;
         break;
       }
